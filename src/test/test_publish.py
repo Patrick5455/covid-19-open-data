@@ -15,16 +15,24 @@
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Dict, List
+from typing import Dict
 from unittest import main
 
 from pandas import DataFrame
-from lib.constants import EXCLUDE_FROM_MAIN_TABLE, SRC
+from lib.constants import (
+    EXCLUDE_FROM_MAIN_TABLE,
+    EXCLUDE_FROM_MAIN_TABLE_V3,
+    OUTPUT_COLUMN_ADAPTER,
+    SRC,
+)
 from lib.io import read_table, read_lines
+from lib.memory_efficient import get_table_columns, skip_head_reader
 from lib.pipeline_tools import get_pipelines, get_schema
+from lib.sql import _safe_table_name, create_sqlite_database, table_export_csv
 
 from .profiled_test_case import ProfiledTestCase
-from publish import copy_tables, convert_tables_to_json, merge_output_tables
+from publish import copy_tables, convert_tables_to_json, publish_global_tables
+from publish import import_tables_into_sqlite, merge_output_tables
 
 # Make the main schema a global variable so we don't have to reload it in every test
 SCHEMA = get_schema()
@@ -67,12 +75,14 @@ class TestPublish(ProfiledTestCase):
         self.assertListEqual(main_table_records, list(sorted(main_table_records)))
 
         # Make the main table easier to deal with since we optimize for memory usage
-        main_table.set_index("key", inplace=True)
+        location_key = "location_key" if "location_key" in main_table.columns else "key"
+        main_table.set_index(location_key, inplace=True)
         main_table["date"] = main_table["date"].astype(str)
 
         # Define sets of columns to check
-        column_prefixes = ("new", "total")
-        columns = [col for col in main_table.columns if col.split("_")[0] in column_prefixes]
+        column_prefixes = ("new", "total", "cumulative")
+        column_filter = lambda col: col.split("_")[0] in column_prefixes and "age" not in col
+        columns = list(filter(column_filter, main_table.columns))
         self.assertGreaterEqual(len({col.split("_")[0] for col in columns}), 2)
         main_table = main_table[["date"] + columns]
 
@@ -85,7 +95,7 @@ class TestPublish(ProfiledTestCase):
         # Spot check: Alachua County
         self._spot_check_subset(main_table, "US_FL_12001", "2020-03-10", "2020-09-01")
 
-    def test_make_main_table(self):
+    def test_make_main_table_v2(self):
         with TemporaryDirectory() as workdir:
             workdir = Path(workdir)
 
@@ -100,17 +110,59 @@ class TestPublish(ProfiledTestCase):
 
             self._test_make_main_table_helper(main_table_path, {})
 
+    def test_make_main_table_v3(self):
+        with TemporaryDirectory() as workdir:
+            workdir = Path(workdir)
+
+            # Copy all test tables into the temporary directory
+            publish_global_tables(SRC / "test" / "data", workdir)
+
+            # Create the main table
+            main_table_path = workdir / "main.csv"
+            merge_output_tables(
+                workdir, main_table_path, exclude_table_names=EXCLUDE_FROM_MAIN_TABLE_V3
+            )
+
+            self._test_make_main_table_helper(main_table_path, OUTPUT_COLUMN_ADAPTER)
+
+    def test_make_main_table_sqlite(self):
+        with TemporaryDirectory() as workdir:
+            workdir = Path(workdir)
+            intermediate = workdir / "intermediate"
+            intermediate.mkdir(parents=True, exist_ok=True)
+
+            # Copy all test tables into the temporary directory
+            publish_global_tables(SRC / "test" / "data", intermediate)
+
+            # Create the SQLite file and open it
+            sqlite_output = workdir / "main.sqlite"
+            import_tables_into_sqlite(intermediate, sqlite_output)
+            with create_sqlite_database(sqlite_output) as conn:
+
+                # Verify that each table contains all the data
+                for table in intermediate.glob("*.csv"):
+
+                    temp_path = workdir / f"{table.stem}.csv"
+                    table_export_csv(conn, _safe_table_name(table.stem), temp_path)
+                    table_columns = get_table_columns(temp_path)
+
+                    self.assertEqual(set(get_table_columns(table)), set(table_columns))
+                    records1 = sorted(skip_head_reader(table))
+                    records2 = sorted(skip_head_reader(temp_path))
+                    for record1, record2 in zip(records1, records2):
+                        self.assertEqual(record1, record2)
+
     def test_convert_to_json(self):
         with TemporaryDirectory() as workdir:
             workdir = Path(workdir)
 
             # Copy all test tables into the temporary directory
-            copy_tables(SRC / "test" / "data", workdir)
+            publish_global_tables(SRC / "test" / "data", workdir)
 
             # Copy test tables again but under a subpath
             subpath = workdir / "latest"
             subpath.mkdir()
-            copy_tables(workdir, subpath)
+            publish_global_tables(workdir, subpath)
 
             # Convert all the tables to JSON under a new path
             jsonpath = workdir / "json"

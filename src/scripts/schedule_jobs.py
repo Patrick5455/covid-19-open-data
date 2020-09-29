@@ -19,8 +19,9 @@ This script schedules all the jobs to be dispatched to AppEngine.
 
 import os
 import sys
-from functools import partial
 from argparse import ArgumentParser
+from functools import partial
+from typing import List
 
 from google.cloud import scheduler_v1
 from google.cloud.scheduler_v1.types import AppEngineHttpTarget, Duration, Job
@@ -28,7 +29,18 @@ from google.cloud.scheduler_v1.types import AppEngineHttpTarget, Duration, Job
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # pylint: disable=wrong-import-position
+from lib.constants import SRC
+from lib.memory_efficient import table_read_column
 from lib.pipeline_tools import get_pipelines
+
+
+def _split_into_subsets(items: List[str], bin_count: int):
+    """ Produce subsets of the given list divided into equal `bin_count` bins """
+    bin_size = len(items) // bin_count
+    for idx in range(bin_count - 1):
+        yield items[bin_size * idx : bin_size * (idx + 1)]
+    # The last bin might have up to `bin_size - 1` additional items
+    yield items[bin_size * (bin_count - 1) :]
 
 
 def clear_jobs(
@@ -83,6 +95,9 @@ def schedule_all_jobs(project_id: str, location_id: str, time_zone: str) -> None
     # Clear all pre-existing jobs
     clear_jobs(client=client, project_id=project_id, location_id=location_id)
 
+    # Read the list of all known locations, since we will be splitting some jobs based on that
+    location_keys = list(table_read_column(SRC / "data" / "metadata.csv", "key"))
+
     # Cache pull job runs hourly
     _schedule_job(schedule="0 * * * *", path="/cache_pull")
 
@@ -131,7 +146,7 @@ def schedule_all_jobs(project_id: str, location_id: str, time_zone: str) -> None
     for data_pipeline in get_pipelines():
         # The job that combines data sources into a table runs hourly
         _schedule_job(
-            path=f"/combine_table?table={data_pipeline.table}",
+            path=f"/deferred/combine_table?table={data_pipeline.table}",
             # Offset by 15 minutes to let other hourly tasks finish
             schedule="15 * * * *",
         )
@@ -154,6 +169,34 @@ def schedule_all_jobs(project_id: str, location_id: str, time_zone: str) -> None
             if job_url not in job_urls_seen:
                 job_urls_seen.add(job_url)
                 _schedule_job(path=job_url, schedule=job_sched)
+
+    # V3 publish jobs start here
+
+    # Publish the tables with all location keys every 2 hours
+    _schedule_job(
+        path="/deferred/publish_v3_global_tables",
+        # Offset by 30 minutes to let other hourly tasks finish
+        schedule="30 */2 * * *",
+    )
+
+    # Break down the outputs by location key every 2 hours, and execute the job in chunks
+    breakdown_job_chunk_count = 5
+    for subset in _split_into_subsets(location_keys, breakdown_job_chunk_count):
+        job_params = f"location_key_from={subset[0]}&location_key_until={subset[-1]}"
+        _schedule_job(
+            path=f"/deferred/publish_v3_location_subsets?{job_params}",
+            # Offset by 60 minutes to let other hourly tasks finish
+            schedule="0 1-23/2 * * *",
+        )
+
+    # Break down the outputs by location key every 2 hours, and execute the job in chunks
+    for subset in _split_into_subsets(location_keys, breakdown_job_chunk_count):
+        job_params = f"location_key_from={subset[0]}&location_key_until={subset[-1]}"
+        _schedule_job(
+            path=f"/deferred/publish_v3_json?{job_params}",
+            # Offset by 90 minutes to let other hourly tasks finish
+            schedule="30 1-23/2 * * *",
+        )
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from tempfile import TemporaryDirectory
 from typing import Callable, Dict, List
 
 from pandas import DataFrame
-from lib.constants import SRC
+from lib.constants import OUTPUT_COLUMN_ADAPTER, SRC
 from lib.io import read_lines, read_table, export_csv
 from lib.memory_efficient import (
     get_table_columns,
@@ -46,24 +46,25 @@ from .profiled_test_case import ProfiledTestCase
 SCHEMA = get_schema()
 
 
+def _compare_tables_equal(test_case: ProfiledTestCase, table1: Path, table2: Path) -> None:
+    cols1 = get_table_columns(table1)
+    cols2 = get_table_columns(table2)
+    test_case.assertEqual(set(cols1), set(cols2))
+
+    # Converting to a CSV in memory sometimes produces out-of-order values
+    records1 = list(read_lines(table1))
+    records2 = list(read_lines(table2))
+    test_case.assertEqual(len(records1), len(records2))
+
+    reader1 = csv.reader(records1)
+    reader2 = csv.reader(records2)
+    for record1, record2 in zip(reader1, reader2):
+        record1 = {col: val for col, val in zip(cols1, record1)}
+        record2 = {col: val for col, val in zip(cols2, record2)}
+        test_case.assertEqual(record1, record2)
+
+
 class TestMemoryEfficient(ProfiledTestCase):
-    def _compare_tables_equal(self, table1: Path, table2: Path) -> None:
-        cols1 = get_table_columns(table1)
-        cols2 = get_table_columns(table2)
-        self.assertEqual(set(cols1), set(cols2))
-
-        # Converting to a CSV in memory sometimes produces out-of-order values
-        records1 = list(read_lines(table1))
-        records2 = list(read_lines(table2))
-        self.assertEqual(len(records1), len(records2))
-
-        reader1 = csv.reader(records1)
-        reader2 = csv.reader(records2)
-        for record1, record2 in zip(reader1, reader2):
-            record1 = {col: val for col, val in zip(cols1, record1)}
-            record2 = {col: val for col, val in zip(cols2, record2)}
-            self.assertEqual(record1, record2)
-
     def _test_join_pair(
         self,
         read_table_: Callable,
@@ -86,7 +87,7 @@ class TestMemoryEfficient(ProfiledTestCase):
             pandas_result = read_table_(left).merge(read_table_(right), on=on, how=how_pandas)
             export_csv(pandas_result, output_file_2, schema=schema)
 
-            self._compare_tables_equal(output_file_1, output_file_2)
+            _compare_tables_equal(self, output_file_1, output_file_2)
 
     def _test_join_all(self, how_mem: str, how_pandas: str):
 
@@ -164,7 +165,7 @@ class TestMemoryEfficient(ProfiledTestCase):
                 [test_file_1, test_file_2, test_file_3], output_file_2, on=["col1"], how=how_mem
             )
 
-            self._compare_tables_equal(output_file_1, output_file_2)
+            _compare_tables_equal(self, output_file_1, output_file_2)
 
     def test_inner_join(self):
         self._test_join_all("inner", "inner")
@@ -238,8 +239,12 @@ class TestMemoryEfficient(ProfiledTestCase):
                 workdir = Path(workdir)
 
                 for csv_file in pbar([*(SRC / "test" / "data").glob("*.csv")], leave=False):
-                    json_output = workdir / csv_file.name.replace("csv", "json")
-                    json_convert_method(SCHEMA, csv_file, json_output)
+                    # Map the CSV file columns first to account for schema changes
+                    csv_temp_file = workdir / f"{csv_file.stem}.csv"
+                    table_rename(csv_file, csv_temp_file, OUTPUT_COLUMN_ADAPTER)
+
+                    json_output = workdir / csv_temp_file.name.replace("csv", "json")
+                    json_convert_method(SCHEMA, csv_temp_file, json_output)
 
                     with json_output.open("r") as fd:
                         json_obj = json.load(fd)
@@ -248,7 +253,7 @@ class TestMemoryEfficient(ProfiledTestCase):
                     csv_test_file = workdir / json_output.name.replace("json", "csv")
                     export_csv(json_df, csv_test_file, schema=SCHEMA)
 
-                    for line1, line2 in zip(read_lines(csv_file), read_lines(csv_test_file)):
+                    for line1, line2 in zip(read_lines(csv_temp_file), read_lines(csv_test_file)):
                         self.assertEqual(line1, line2)
 
     def test_table_group_tail(self):

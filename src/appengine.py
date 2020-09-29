@@ -37,7 +37,16 @@ from google.oauth2.credentials import Credentials
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # pylint: disable=wrong-import-position
-from publish import copy_tables, convert_tables_to_json, create_table_subsets, merge_output_tables
+from publish import (
+    copy_tables,
+    convert_tables_to_json,
+    create_table_subsets,
+    import_tables_into_sqlite,
+    merge_output_tables,
+    publish_global_tables,
+    publish_location_breakouts,
+    publish_location_aggregates,
+)
 from scripts.cloud_error_processing import register_new_errors
 
 from lib.concurrent import thread_map
@@ -45,6 +54,7 @@ from lib.constants import GCS_BUCKET_PROD, GCS_BUCKET_TEST, SRC
 from lib.error_logger import ErrorLogger
 from lib.gcloud import delete_instance, get_internal_ip, start_instance
 from lib.io import export_csv
+from lib.memory_efficient import table_read_column
 from lib.net import download
 from lib.pipeline import DataPipeline
 from lib.pipeline_tools import get_table_names
@@ -430,6 +440,133 @@ def publish_subset_tables() -> Response:
     return Response("OK", status=200)
 
 
+@profiled_route("/publish_v3_global_tables")
+def publish_v3_global_tables() -> Response:
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+        tables_folder = workdir / "tables"
+        public_folder = workdir / "public"
+        tables_folder.mkdir(parents=True, exist_ok=True)
+        public_folder.mkdir(parents=True, exist_ok=True)
+
+        # Download all the combined tables into our local storage
+        download_folder(GCS_BUCKET_TEST, "tables", tables_folder)
+
+        # Publish the tables containing all location keys
+        publish_global_tables(tables_folder, public_folder)
+        logger.log_info("Global tables created")
+
+        # Upload the results to the prod bucket
+        upload_folder(GCS_BUCKET_PROD, "v3", public_folder)
+
+    return Response("OK", status=200)
+
+
+@profiled_route("/publish_v3_location_subsets")
+def publish_v3_location_subsets(
+    location_key_from: str = None, location_key_until: str = None
+) -> Response:
+    location_key_from = _get_request_param("location_key_from", location_key_from)
+    location_key_until = _get_request_param("location_key_until", location_key_until)
+
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+        input_folder = workdir / "input"
+        intermediate_folder = workdir / "temp"
+        output_folder = workdir / "output"
+        input_folder.mkdir(parents=True, exist_ok=True)
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        location_keys = list(table_read_column(SRC / "data" / "metadata.csv", "key"))
+        if location_key_from is not None:
+            location_keys = [key for key in location_keys if key >= location_key_from]
+        if location_key_until is not None:
+            location_keys = [key for key in location_keys if key <= location_key_until]
+        logger.log_info(
+            f"Publishing {len(location_keys)} location subsets "
+            f"from {location_keys[0]} until {location_keys[-1]}"
+        )
+
+        # Download all the global tables into our local storage
+        download_folder(GCS_BUCKET_PROD, "v3", input_folder, lambda x: "/" not in str(x))
+
+        # Break out each table into separate folders based on the location key
+        publish_location_breakouts(input_folder, intermediate_folder)
+
+        # Aggregate the tables for each location independently
+        publish_location_aggregates(intermediate_folder, output_folder, location_keys)
+
+        # Upload the results to the prod bucket
+        upload_folder(GCS_BUCKET_PROD, "v3", output_folder)
+
+    return Response("OK", status=200)
+
+
+@profiled_route("/publish_v3_sqlite")
+def publish_v3_sqlite() -> Response:
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+        input_folder = workdir / "input"
+        output_folder = workdir / "output"
+        input_folder.mkdir(parents=True, exist_ok=True)
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        # Download all the global tables into our local storage
+        download_folder(GCS_BUCKET_PROD, "v3", input_folder, lambda x: "/" not in str(x))
+
+        # Publish the SQLite file containing all data
+        sqlite_path = output_folder / "covid-19-open-data.sqlite"
+        import_tables_into_sqlite(input_folder, sqlite_path)
+
+        # Upload the results to the prod bucket
+        upload_folder(GCS_BUCKET_PROD, "v3", output_folder)
+
+    return Response("OK", status=200)
+
+
+@profiled_route("/publish_v3_json")
+def publish_v3_json(location_key_from: str = None, location_key_until: str = None) -> Response:
+    location_key_from = _get_request_param("location_key_from", location_key_from)
+    location_key_until = _get_request_param("location_key_until", location_key_until)
+
+    with TemporaryDirectory() as workdir:
+        workdir = Path(workdir)
+        input_folder = workdir / "input"
+        output_folder = workdir / "output"
+        input_folder.mkdir(parents=True, exist_ok=True)
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        # Convert the tables to JSON for each location independently
+        location_keys = list(table_read_column(SRC / "data" / "metadata.csv", "key"))
+        if location_key_from is not None:
+            location_keys = [key for key in location_keys if key >= location_key_from]
+        if location_key_until is not None:
+            location_keys = [key for key in location_keys if key <= location_key_until]
+        logger.log_info(
+            f"Converting {len(location_keys)} location subsets to JSON "
+            f"from {location_keys[0]} until {location_keys[-1]}"
+        )
+
+        # Download all the processed tables into our local storage
+        def match_path(table_path: Path) -> bool:
+            try:
+                location_key, table_name = str(table_path).split("/", 1)
+                return table_name == "main.csv" and location_key in location_keys
+            except:
+                return False
+
+        download_folder(GCS_BUCKET_PROD, "v3", input_folder, match_path)
+
+        # Convert all files to JSON
+        list(convert_tables_to_json(input_folder, output_folder))
+        logger.log_info("CSV files converted to JSON")
+
+        # Upload the results to the prod bucket
+        upload_folder(GCS_BUCKET_PROD, "v3", output_folder)
+
+    return Response("OK", status=200)
+
+
 def _convert_json(expr: str = r"*.csv") -> Response:
     with TemporaryDirectory() as workdir:
         workdir = Path(workdir)
@@ -541,6 +678,10 @@ def main() -> None:
         publish_main_table()
         publish_subset_tables()
 
+    def _publish_v3():
+        publish_v3_global_tables()
+        publish_v3_location_subsets()
+
     def _unknown_command(*func_args):
         logger.log_error(f"Unknown command {args.command}")
 
@@ -552,7 +693,9 @@ def main() -> None:
         "combine_table": combine_table,
         "cache_pull": cache_pull,
         "publish": _publish,
+        "publish_v3": _publish_v3,
         "convert_json": _convert_json,
+        "convert_json_v3": publish_v3_json,
         "report_errors_to_github": report_errors_to_github,
     }.get(args.command, _unknown_command)(**json.loads(args.args or "{}"))
 
